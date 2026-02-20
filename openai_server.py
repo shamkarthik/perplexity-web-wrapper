@@ -43,31 +43,69 @@ MODE_MAP = {
     "o3-mini":            "reasoning",
 }
 
-CLINE_SYSTEM_PROMPT = """You are a coding agent. STRICT RULES:
+# Exact Cline system prompt based on official Cline source
+CLINE_SYSTEM_PROMPT = """You are Cline, a highly skilled software engineer with extensive knowledge in many programming languages, frameworks, design patterns, and best practices.
 
-RULE 1: Always include ALL required fields in tool calls. NEVER omit <path>.
+====
 
-To write/create a file use EXACTLY this format:
+TOOL USE
+
+You have access to a set of tools that are executed upon the user's approval. You can use one tool per message, and will receive the result of that tool use in the user's response. You use tools step-by-step to accomplish a given task, with each tool use informed by the result of the previous tool use.
+
+# Tool Use Formatting
+
+Tool use is formatted using XML-style tags. The tool name is enclosed in opening and closing tags, and each parameter is similarly enclosed within its own set of tags. Here's the structure:
+
+<tool_name>
+<parameter1_name>value1</parameter1_name>
+<parameter2_name>value2</parameter2_name>
+</tool_name>
+
+Always adhere to this format for the tool use to ensure proper parsing and execution.
+
+# Tools
+
+## execute_command
+Description: Execute a CLI command on the system.
+Parameters:
+- command: (required) The CLI command to execute.
+- requires_approval: (required) A boolean (true or false) indicating whether this command requires explicit user approval. Set to 'false' for safe read-only operations. Set to 'true' for installs, deletes, or destructive operations.
+Usage:
+<execute_command>
+<command>your command here</command>
+<requires_approval>false</requires_approval>
+</execute_command>
+
+## read_file
+Description: Read the contents of a file at the specified path.
+Parameters:
+- path: (required) The path of the file to read.
+Usage:
+<read_file>
+<path>path/to/file</path>
+</read_file>
+
+## write_to_file
+Description: Write content to a file. Creates file if it doesn't exist.
+Parameters:
+- path: (required) The path of the file to write to.
+- content: (required) The COMPLETE file content — never truncate.
+Usage:
 <write_to_file>
-<path>exact/filename.ext</path>
+<path>path/to/file</path>
 <content>
 full file content here
 </content>
 </write_to_file>
 
-To read a file:
-<read_file>
-<path>exact/filename.ext</path>
-</read_file>
-
-To run a terminal command:
-<execute_command>
-<command>command here</command>
-</execute_command>
-
-To search and replace in a file:
+## replace_in_file
+Description: Make targeted edits to specific parts of an existing file.
+Parameters:
+- path: (required) The path of the file to modify.
+- diff: (required) SEARCH/REPLACE blocks.
+Usage:
 <replace_in_file>
-<path>exact/filename.ext</path>
+<path>path/to/file</path>
 <diff>
 <<<<<<< SEARCH
 old code
@@ -77,23 +115,71 @@ new code
 </diff>
 </replace_in_file>
 
-To ask the user a question:
+## search_files
+Description: Regex search across files in a directory.
+Parameters:
+- path: (required) Directory to search in.
+- regex: (required) Regular expression pattern.
+- file_pattern: (optional) Glob pattern to filter files.
+Usage:
+<search_files>
+<path>.</path>
+<regex>def .*</regex>
+<file_pattern>*.py</file_pattern>
+</search_files>
+
+## list_files
+Description: List files and directories within a specified directory.
+Parameters:
+- path: (required) The directory to list.
+- recursive: (optional) true or false.
+Usage:
+<list_files>
+<path>.</path>
+<recursive>false</recursive>
+</list_files>
+
+## list_code_definition_names
+Description: List classes, functions, methods in source files at the top level of a directory.
+Parameters:
+- path: (required) Directory path.
+Usage:
+<list_code_definition_names>
+<path>.</path>
+</list_code_definition_names>
+
+## ask_followup_question
+Description: Ask the user a question to gather additional information.
+Parameters:
+- question: (required) A clear, specific question.
+Usage:
 <ask_followup_question>
-<question>your question here</question>
+<question>Your question here</question>
 </ask_followup_question>
 
-To finish the task:
+## attempt_completion
+Description: Present the final result once the task is complete.
+Parameters:
+- result: (required) Final description of what was done.
+- command: (optional) CLI command to demo the result.
+Usage:
 <attempt_completion>
-<result>description of what was done</result>
+<result>
+Your final result description here
+</result>
 </attempt_completion>
 
+====
+
 CRITICAL RULES:
-- Output ONE tool call per response — nothing else before or after it
-- NEVER wrap tool calls in markdown code blocks or backticks
-- NEVER add citation numbers like [1][2][3]
-- ALWAYS include <path> tag in write_to_file and read_file
-- Read a file before editing it
-- Think step by step, use tools to gather info before making changes"""
+1. Output ONE tool call per response — NOTHING else before or after it
+2. NEVER wrap tool calls in markdown code blocks or backticks
+3. NEVER add citation numbers like [1][2][3] inside tool calls
+4. ALWAYS include ALL required parameters — especially <path> and <requires_approval>
+5. Use <thinking></thinking> tags internally to reason, but output only the tool call
+6. Read a file before editing it
+7. Wait for tool result before next tool call
+8. For execute_command, ALWAYS include <requires_approval>false</requires_approval> for safe commands"""
 
 
 def resolve_mode(model: str) -> str:
@@ -120,40 +206,41 @@ def content_to_str(content) -> str:
 
 
 def fix_cline_tool_calls(answer: str, messages: list) -> str:
-    """Fix common malformed XML tool calls from Perplexity."""
+    """Post-process Perplexity response to fix malformed Cline XML tool calls."""
 
-    # Strip markdown code fences wrapping tool calls
+    # Strip markdown fences around tool calls
     answer = re.sub(r"```(?:xml)?\s*\n?(<[a-z_]+>)", r"\1", answer)
     answer = re.sub(r"(</[a-z_]+>)\s*\n?```", r"\1", answer)
 
-    # Strip citation numbers like [1][2][3]
+    # Strip citation numbers [1][2] that break XML
     answer = re.sub(r"\[\d+\]", "", answer)
 
-    # Fix write_to_file missing <path>
-    if "<write_to_file>" in answer and "<path>" not in answer:
-        last_user_msg = ""
-        for m in reversed(messages):
-            if m.get("role") == "user":
-                last_user_msg = content_to_str(m.get("content", ""))
-                break
+    # Get last user message for filename inference
+    last_user_msg = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            last_user_msg = content_to_str(m.get("content", ""))
+            break
 
-        filename = "output.md"
+    def infer_filename(fallback="output.md") -> str:
         patterns = [
             r"create\s+(?:a\s+)?(\S+\.\w+)",
             r"write\s+(?:to\s+)?(\S+\.\w+)",
             r"make\s+(?:a\s+)?(\S+\.\w+)",
             r"file\s+(?:called\s+|named\s+)?(\S+\.\w+)",
-            r"(\S+\.(?:md|txt|py|json|yaml|yml|js|ts|dart|sh|env))",
+            r"(\S+\.(?:md|txt|py|json|yaml|yml|js|ts|dart|sh|env|toml|cfg))",
         ]
         for pattern in patterns:
             match = re.search(pattern, last_user_msg, re.IGNORECASE)
             if match:
-                filename = match.group(1)
-                break
+                return match.group(1)
+        return fallback
 
+    # Fix write_to_file missing <path>
+    if "<write_to_file>" in answer and "<path>" not in answer:
         answer = answer.replace(
             "<write_to_file>",
-            f"<write_to_file>\n<path>{filename}</path>"
+            f"<write_to_file>\n<path>{infer_filename('output.md')}</path>"
         )
 
     # Fix read_file missing <path>
@@ -167,7 +254,29 @@ def fix_cline_tool_calls(answer: str, messages: list) -> str:
     if "<replace_in_file>" in answer and "<path>" not in answer:
         answer = answer.replace(
             "<replace_in_file>",
-            "<replace_in_file>\n<path>openai_server.py</path>"
+            f"<replace_in_file>\n<path>{infer_filename('openai_server.py')}</path>"
+        )
+
+    # Fix execute_command missing <requires_approval>
+    if "<execute_command>" in answer and "<requires_approval>" not in answer:
+        # Inject before closing tag
+        answer = answer.replace(
+            "</execute_command>",
+            "<requires_approval>false</requires_approval>\n</execute_command>"
+        )
+
+    # Fix search_files missing <path>
+    if "<search_files>" in answer and "<path>" not in answer:
+        answer = answer.replace(
+            "<search_files>",
+            "<search_files>\n<path>.</path>"
+        )
+
+    # Fix list_files missing <path>
+    if "<list_files>" in answer and "<path>" not in answer:
+        answer = answer.replace(
+            "<list_files>",
+            "<list_files>\n<path>.</path>"
         )
 
     return answer.strip()
@@ -176,23 +285,19 @@ def fix_cline_tool_calls(answer: str, messages: list) -> str:
 def build_query(messages: list, tools: list = None) -> str:
     parts = []
 
-    # Always inject Cline system prompt
     parts.append(CLINE_SYSTEM_PROMPT)
 
-    # Append original system messages
     for m in messages:
         if m.get("role") == "system":
             content = content_to_str(m.get("content", ""))
             if content:
                 parts.append(f"[Additional instructions: {content}]")
 
-    # Add tool names as context
     if tools:
         tool_names = [t.get("function", {}).get("name", "") for t in tools if "function" in t]
         if tool_names:
             parts.append(f"[Available tools: {', '.join(tool_names)}]")
 
-    # Add conversation history
     for m in messages:
         role    = m.get("role", "")
         content = content_to_str(m.get("content", ""))
@@ -212,14 +317,12 @@ def extract_answer(result) -> str:
     if not isinstance(result, dict):
         return str(result)
 
-    # 1. Best: blocks -> markdown_block -> answer
     blocks = result.get("blocks", [])
     for block in blocks:
         mb = block.get("markdown_block")
         if mb and mb.get("answer"):
             return mb["answer"]
 
-    # 2. Fallback: FINAL step in text array
     text_steps = result.get("text", [])
     if isinstance(text_steps, list):
         for step in reversed(text_steps):
@@ -233,7 +336,6 @@ def extract_answer(result) -> str:
                     except Exception:
                         return raw_answer
 
-    # 3. Last resort
     return json.dumps(result)
 
 
@@ -325,9 +427,8 @@ async def chat_completions(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
     answer = extract_answer(result)
-    answer = fix_cline_tool_calls(answer, messages)  # ← fixes malformed XML
+    answer = fix_cline_tool_calls(answer, messages)
 
-    # ── Streaming ──
     if stream:
         def event_stream():
             words = answer.split(" ")
@@ -339,7 +440,6 @@ async def chat_completions(request: Request):
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-    # ── Standard ──
     return JSONResponse({
         "id":      f"chatcmpl-{uuid.uuid4().hex[:8]}",
         "object":  "chat.completion",
