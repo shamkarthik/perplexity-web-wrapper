@@ -313,3 +313,33 @@ class Client:
         resp = self.session.get(url)
         resp.raise_for_status()
         return resp.json()
+
+def base64_to_files(messages: list) -> dict:
+    """
+    Extract base64 images from OpenAI-format messages and
+    return a {filename: bytes} dict ready for Client.search(files=...)
+    """
+    files = {}
+    idx = 0
+    for m in messages:
+        content = m.get("content", "")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") != "image_url":
+                continue
+            img = item.get("image_url", {})
+            url = img.get("url", "") if isinstance(img, dict) else img
+            if not url.startswith("data:"):
+                continue
+            # data:image/jpeg;base64,/9j/4AAQ...
+            header, b64 = url.split(",", 1)
+            mime = header.split(":")[1].split(";")[0]          # image/jpeg
+            ext  = mime.split("/")[-1].replace("jpeg", "jpg")  # jpg
+            filename = f"cline_image_{idx}.{ext}"
+            import base64
+            files[filename] = base64.b64decode(b64)
+            idx += 1
+    return files
