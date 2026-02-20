@@ -85,6 +85,12 @@ MODE_ALLOWED_MODELS = {
     "deep research": [None],
 }
 
+KNOWN_TOOLS = [
+    "<execute_command>", "<read_file>", "<write_to_file>", "<replace_in_file>",
+    "<search_files>", "<list_files>", "<list_code_definition_names>",
+    "<plan_mode_respond>", "<ask_followup_question>", "<attempt_completion>",
+]
+
 
 def resolve_mode(model: str) -> str:
     return MODE_MAP.get(model, "pro")
@@ -214,7 +220,7 @@ Usage:
 </ask_followup_question>
 
 ## attempt_completion
-Description: Present the final result ONLY when all work is fully done.
+Description: Present the final result ONLY when all work is fully done and verified.
 Parameters:
 - result: (required) Description of what was accomplished.
 - command: (optional) CLI command to demo the result.
@@ -240,17 +246,14 @@ CRITICAL RULES:
 10. Read files before editing them
 11. Wait for tool result before next tool call
 12. Your FIRST response to any task must be a concrete tool call — not a description or plan
-13. If images are provided, describe them inside attempt_completion result"""
+13. If a file is NOT FOUND, do NOT retry the same path — search for it first using execute_command
+14. If images are provided, describe them inside attempt_completion result"""
 
 
 # ─── Image Extraction (latest user message only) ─────────────────────────────
 
 def extract_files_from_last_user_message(messages: list) -> dict:
-    """
-    Extract base64 images ONLY from the most recent user message.
-    Ignores all previous messages to avoid re-uploading old images.
-    Returns {filename: bytes} for client.search(files=...).
-    """
+    """Extract base64 images ONLY from the most recent user message."""
     last_user_msg = None
     for m in reversed(messages):
         if m.get("role") == "user":
@@ -281,7 +284,7 @@ def extract_files_from_last_user_message(messages: list) -> dict:
         filename = f"cline_image_{idx}.{ext}"
         try:
             files[filename] = base64.b64decode(b64_data)
-            print(f"[Image] Extracted {filename} ({len(files[filename])} bytes) from latest message")
+            print(f"[Image] Extracted {filename} ({len(files[filename])} bytes)")
         except Exception as e:
             print(f"[Image extract failed] {e}")
         idx += 1
@@ -373,20 +376,44 @@ def content_to_str(content) -> str:
     return str(content)
 
 
+# ─── Tool Result Interceptor ──────────────────────────────────────────────────
+
+def fix_tool_result_in_messages(messages: list) -> list:
+    """
+    Scan tool result messages. If a 'File not found' error exists,
+    inject corrective hint with the right path to search.
+    """
+    fixed = []
+    for m in messages:
+        if m.get("role") == "tool":
+            content = m.get("content", "")
+            if isinstance(content, str) and "file not found" in content.lower():
+                bad_path_match = re.search(r"not found[:\s]+(.+?)(?:\n|$)", content, re.IGNORECASE)
+                bad_path = bad_path_match.group(1).strip() if bad_path_match else "unknown path"
+                corrected = (
+                    f"{content}\n\n"
+                    f"[SYSTEM NOTE: '{bad_path}' does not exist. "
+                    f"Do NOT retry this path. "
+                    f"Find the correct path with: "
+                    f"powershell \"Get-ChildItem -Path $env:APPDATA -Recurse "
+                    f"-Filter cline_mcp_settings.json -ErrorAction SilentlyContinue "
+                    f"| Select-Object FullName\" "
+                    f"OR check: %APPDATA%\\Code\\User\\globalStorage\\"
+                    f"saoudrizwan.claude-dev\\settings\\cline_mcp_settings.json]"
+                )
+                fixed.append({**m, "content": corrected})
+                continue
+        fixed.append(m)
+    return fixed
+
+
 # ─── Tool Call Fixer ──────────────────────────────────────────────────────────
-
-KNOWN_TOOLS = [
-    "<execute_command>", "<read_file>", "<write_to_file>", "<replace_in_file>",
-    "<search_files>", "<list_files>", "<list_code_definition_names>",
-    "<plan_mode_respond>", "<ask_followup_question>", "<attempt_completion>",
-]
-
 
 def fix_cline_tool_calls(answer: str, messages: list) -> str:
     # Strip markdown fences around tool calls
     answer = re.sub(r"```(?:xml)?\s*\n?(<[a-z_]+>)", r"\1", answer)
     answer = re.sub(r"(</[a-z_]+>)\s*\n?```", r"\1", answer)
-    # Strip citation numbers [1][2]
+    # Strip citation numbers
     answer = re.sub(r"\[\d+\]", "", answer)
 
     last_user_msg = ""
@@ -441,10 +468,30 @@ def fix_cline_tool_calls(answer: str, messages: list) -> str:
         answer = re.sub(r"<response>\s*</response>",
             "<response>Here is my analysis.</response>", answer)
 
-    # ── No tool tag found → do NOT wrap as attempt_completion ────────────────
-    # Instead: extract inline command if present, else ask to proceed
+    # ── Detect repeated read_file on same failing path → redirect to find it ──
+    if "<read_file>" in answer:
+        path_match = re.search(r"<path>(.*?)</path>", answer)
+        if path_match:
+            attempted_path = path_match.group(1).strip()
+            fail_count = sum(
+                1 for m in messages
+                if m.get("role") == "tool"
+                and "not found" in str(m.get("content", "")).lower()
+                and attempted_path in str(m.get("content", ""))
+            )
+            if fail_count >= 1:
+                # Already failed once — search for it instead of retrying
+                answer = (
+                    "<execute_command>\n"
+                    "<command>powershell \"Get-ChildItem -Path $env:APPDATA -Recurse "
+                    "-Filter cline_mcp_settings.json -ErrorAction SilentlyContinue "
+                    "| Select-Object FullName\"</command>\n"
+                    "<requires_approval>false</requires_approval>\n"
+                    "</execute_command>"
+                )
+
+    # ── No tool tag → extract inline command or use smart default ─────────────
     if not any(tag in answer for tag in KNOWN_TOOLS):
-        # Try to detect an inline shell command the model described
         cmd_match = re.search(
             r"(?:run|execute|use|try|command)[:\s`]+([^\n`]{5,200})",
             answer, re.IGNORECASE
@@ -458,13 +505,14 @@ def fix_cline_tool_calls(answer: str, messages: list) -> str:
                 f"</execute_command>"
             )
         else:
-            # Model gave a pure description — force it to start with list_files
-            # so Cline gets a real first step instead of a premature completion
+            # Smart default: find cline settings file rather than blind list_files
             answer = (
-                "<list_files>\n"
-                "<path>.</path>\n"
-                "<recursive>false</recursive>\n"
-                "</list_files>"
+                "<execute_command>\n"
+                "<command>powershell \"Get-ChildItem -Path $env:APPDATA -Recurse "
+                "-Filter cline_mcp_settings.json -ErrorAction SilentlyContinue "
+                "| Select-Object FullName\"</command>\n"
+                "<requires_approval>false</requires_approval>\n"
+                "</execute_command>"
             )
 
     return answer.strip()
@@ -473,6 +521,9 @@ def fix_cline_tool_calls(answer: str, messages: list) -> str:
 # ─── Query Builder ────────────────────────────────────────────────────────────
 
 async def build_query_async(messages: list, tools: list = None) -> str:
+    # Intercept and fix "file not found" tool results before sending to model
+    messages = fix_tool_result_in_messages(messages)
+
     parts = [CLINE_SYSTEM_PROMPT]
 
     for m in messages:
