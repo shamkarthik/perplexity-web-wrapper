@@ -3,7 +3,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from lib.perplexity import Client
 from concurrent.futures import ThreadPoolExecutor
-import asyncio, json, uuid, time
+import asyncio, json, uuid, time, re
 
 app = FastAPI()
 
@@ -43,31 +43,31 @@ MODE_MAP = {
     "o3-mini":            "reasoning",
 }
 
-# Cline agent system prompt injected into every request
-CLINE_SYSTEM_PROMPT = """You are Cline, an expert software engineer and coding agent.
+CLINE_SYSTEM_PROMPT = """You are a coding agent. STRICT RULES:
 
-CRITICAL RULES — follow exactly:
-1. When you need to read a file, respond ONLY with:
-<read_file>
-<path>path/to/file</path>
-</read_file>
+RULE 1: Always include ALL required fields in tool calls. NEVER omit <path>.
 
-2. When you need to write/create a file, respond ONLY with:
+To write/create a file use EXACTLY this format:
 <write_to_file>
-<path>path/to/file</path>
+<path>exact/filename.ext</path>
 <content>
 full file content here
 </content>
 </write_to_file>
 
-3. When you need to run a terminal command, respond ONLY with:
+To read a file:
+<read_file>
+<path>exact/filename.ext</path>
+</read_file>
+
+To run a terminal command:
 <execute_command>
-<command>the command</command>
+<command>command here</command>
 </execute_command>
 
-4. When you need to search/replace code in a file, respond ONLY with:
+To search and replace in a file:
 <replace_in_file>
-<path>path/to/file</path>
+<path>exact/filename.ext</path>
 <diff>
 <<<<<<< SEARCH
 old code
@@ -77,20 +77,23 @@ new code
 </diff>
 </replace_in_file>
 
-5. When you need to ask the user a question, respond ONLY with:
+To ask the user a question:
 <ask_followup_question>
-<question>your question</question>
+<question>your question here</question>
 </ask_followup_question>
 
-6. When the task is complete, respond ONLY with:
+To finish the task:
 <attempt_completion>
 <result>description of what was done</result>
 </attempt_completion>
 
-7. NEVER add markdown, explanations, or text before/after a tool call block.
-8. ONE tool call per response. Wait for result before next tool call.
-9. Think step by step, use tools to gather info before making changes.
-10. Always read a file before editing it."""
+CRITICAL RULES:
+- Output ONE tool call per response — nothing else before or after it
+- NEVER wrap tool calls in markdown code blocks or backticks
+- NEVER add citation numbers like [1][2][3]
+- ALWAYS include <path> tag in write_to_file and read_file
+- Read a file before editing it
+- Think step by step, use tools to gather info before making changes"""
 
 
 def resolve_mode(model: str) -> str:
@@ -116,22 +119,74 @@ def content_to_str(content) -> str:
     return str(content)
 
 
+def fix_cline_tool_calls(answer: str, messages: list) -> str:
+    """Fix common malformed XML tool calls from Perplexity."""
+
+    # Strip markdown code fences wrapping tool calls
+    answer = re.sub(r"```(?:xml)?\s*\n?(<[a-z_]+>)", r"\1", answer)
+    answer = re.sub(r"(</[a-z_]+>)\s*\n?```", r"\1", answer)
+
+    # Strip citation numbers like [1][2][3]
+    answer = re.sub(r"\[\d+\]", "", answer)
+
+    # Fix write_to_file missing <path>
+    if "<write_to_file>" in answer and "<path>" not in answer:
+        last_user_msg = ""
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                last_user_msg = content_to_str(m.get("content", ""))
+                break
+
+        filename = "output.md"
+        patterns = [
+            r"create\s+(?:a\s+)?(\S+\.\w+)",
+            r"write\s+(?:to\s+)?(\S+\.\w+)",
+            r"make\s+(?:a\s+)?(\S+\.\w+)",
+            r"file\s+(?:called\s+|named\s+)?(\S+\.\w+)",
+            r"(\S+\.(?:md|txt|py|json|yaml|yml|js|ts|dart|sh|env))",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, last_user_msg, re.IGNORECASE)
+            if match:
+                filename = match.group(1)
+                break
+
+        answer = answer.replace(
+            "<write_to_file>",
+            f"<write_to_file>\n<path>{filename}</path>"
+        )
+
+    # Fix read_file missing <path>
+    if "<read_file>" in answer and "<path>" not in answer:
+        answer = answer.replace(
+            "<read_file>",
+            "<read_file>\n<path>openai_server.py</path>"
+        )
+
+    # Fix replace_in_file missing <path>
+    if "<replace_in_file>" in answer and "<path>" not in answer:
+        answer = answer.replace(
+            "<replace_in_file>",
+            "<replace_in_file>\n<path>openai_server.py</path>"
+        )
+
+    return answer.strip()
+
+
 def build_query(messages: list, tools: list = None) -> str:
     parts = []
 
-    # Always inject Cline system prompt first
+    # Always inject Cline system prompt
     parts.append(CLINE_SYSTEM_PROMPT)
 
-    # Extract and append original system message if any
+    # Append original system messages
     for m in messages:
-        role    = m.get("role", "")
-        content = content_to_str(m.get("content", ""))
-        if not content:
-            continue
-        if role == "system":
-            parts.append(f"[Additional instructions: {content}]")
+        if m.get("role") == "system":
+            content = content_to_str(m.get("content", ""))
+            if content:
+                parts.append(f"[Additional instructions: {content}]")
 
-    # Add tool definitions as context
+    # Add tool names as context
     if tools:
         tool_names = [t.get("function", {}).get("name", "") for t in tools if "function" in t]
         if tool_names:
@@ -157,12 +212,14 @@ def extract_answer(result) -> str:
     if not isinstance(result, dict):
         return str(result)
 
+    # 1. Best: blocks -> markdown_block -> answer
     blocks = result.get("blocks", [])
     for block in blocks:
         mb = block.get("markdown_block")
         if mb and mb.get("answer"):
             return mb["answer"]
 
+    # 2. Fallback: FINAL step in text array
     text_steps = result.get("text", [])
     if isinstance(text_steps, list):
         for step in reversed(text_steps):
@@ -176,6 +233,7 @@ def extract_answer(result) -> str:
                     except Exception:
                         return raw_answer
 
+    # 3. Last resort
     return json.dumps(result)
 
 
@@ -203,7 +261,7 @@ def timeout_response(model: str) -> dict:
             "index": 0,
             "message": {
                 "role":    "assistant",
-                "content": "⚠️ Request timed out. Perplexity took too long to respond. Please try again."
+                "content": "⚠️ Request timed out. Perplexity took too long. Please try again."
             },
             "finish_reason": "stop"
         }],
@@ -267,6 +325,7 @@ async def chat_completions(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
     answer = extract_answer(result)
+    answer = fix_cline_tool_calls(answer, messages)  # ← fixes malformed XML
 
     # ── Streaming ──
     if stream:
