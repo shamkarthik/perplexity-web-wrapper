@@ -30,6 +30,7 @@ From the project root, start the FastAPI server using Uvicorn:
 
 ```sh
 uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
+uv run uvicorn openai_server:app --host 0.0.0.0 --port 8001 --reload
 ```
 
 ## Supported Library Functionality
