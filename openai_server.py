@@ -3,7 +3,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from lib.perplexity import Client
 from concurrent.futures import ThreadPoolExecutor
-import asyncio, json, uuid, time, re
+import asyncio, json, uuid, time, re, base64, httpx
 
 app = FastAPI()
 
@@ -43,7 +43,6 @@ MODE_MAP = {
     "o3-mini":            "reasoning",
 }
 
-# Exact Cline system prompt based on official Cline source
 CLINE_SYSTEM_PROMPT = """You are Cline, a highly skilled software engineer with extensive knowledge in many programming languages, frameworks, design patterns, and best practices.
 
 ====
@@ -54,14 +53,14 @@ You have access to a set of tools that are executed upon the user's approval. Yo
 
 # Tool Use Formatting
 
-Tool use is formatted using XML-style tags. The tool name is enclosed in opening and closing tags, and each parameter is similarly enclosed within its own set of tags. Here's the structure:
+Tool use is formatted using XML-style tags. The tool name is enclosed in opening and closing tags, and each parameter is similarly enclosed within its own set of tags:
 
 <tool_name>
 <parameter1_name>value1</parameter1_name>
 <parameter2_name>value2</parameter2_name>
 </tool_name>
 
-Always adhere to this format for the tool use to ensure proper parsing and execution.
+Always adhere to this format. Output ONE tool call per response — nothing else before or after it.
 
 # Tools
 
@@ -69,7 +68,7 @@ Always adhere to this format for the tool use to ensure proper parsing and execu
 Description: Execute a CLI command on the system.
 Parameters:
 - command: (required) The CLI command to execute.
-- requires_approval: (required) A boolean (true or false) indicating whether this command requires explicit user approval. Set to 'false' for safe read-only operations. Set to 'true' for installs, deletes, or destructive operations.
+- requires_approval: (required) true or false. Use false for safe/read-only commands. Use true for installs, deletes, destructive ops.
 Usage:
 <execute_command>
 <command>your command here</command>
@@ -79,17 +78,17 @@ Usage:
 ## read_file
 Description: Read the contents of a file at the specified path.
 Parameters:
-- path: (required) The path of the file to read.
+- path: (required) Path of file to read.
 Usage:
 <read_file>
 <path>path/to/file</path>
 </read_file>
 
 ## write_to_file
-Description: Write content to a file. Creates file if it doesn't exist.
+Description: Write content to a file at the specified path. Creates file if it doesn't exist. Always provide COMPLETE file content.
 Parameters:
-- path: (required) The path of the file to write to.
-- content: (required) The COMPLETE file content — never truncate.
+- path: (required) Path of file to write.
+- content: (required) Complete file content — never truncate or use placeholders.
 Usage:
 <write_to_file>
 <path>path/to/file</path>
@@ -99,39 +98,39 @@ full file content here
 </write_to_file>
 
 ## replace_in_file
-Description: Make targeted edits to specific parts of an existing file.
+Description: Make targeted edits to specific parts of a file using SEARCH/REPLACE blocks.
 Parameters:
-- path: (required) The path of the file to modify.
-- diff: (required) SEARCH/REPLACE blocks.
+- path: (required) Path of file to modify.
+- diff: (required) One or more SEARCH/REPLACE blocks.
 Usage:
 <replace_in_file>
 <path>path/to/file</path>
 <diff>
 <<<<<<< SEARCH
-old code
+old code to find
 =======
-new code
+new replacement code
 >>>>>>> REPLACE
 </diff>
 </replace_in_file>
 
 ## search_files
-Description: Regex search across files in a directory.
+Description: Perform a regex search across files in a directory.
 Parameters:
 - path: (required) Directory to search in.
-- regex: (required) Regular expression pattern.
-- file_pattern: (optional) Glob pattern to filter files.
+- regex: (required) Regex pattern to search for.
+- file_pattern: (optional) Glob pattern to filter files (e.g. *.py).
 Usage:
 <search_files>
 <path>.</path>
-<regex>def .*</regex>
+<regex>pattern</regex>
 <file_pattern>*.py</file_pattern>
 </search_files>
 
 ## list_files
-Description: List files and directories within a specified directory.
+Description: List files and directories within a path.
 Parameters:
-- path: (required) The directory to list.
+- path: (required) Directory to list.
 - recursive: (optional) true or false.
 Usage:
 <list_files>
@@ -140,7 +139,7 @@ Usage:
 </list_files>
 
 ## list_code_definition_names
-Description: List classes, functions, methods in source files at the top level of a directory.
+Description: List top-level code definitions (classes, functions, methods) in a directory.
 Parameters:
 - path: (required) Directory path.
 Usage:
@@ -148,45 +147,117 @@ Usage:
 <path>.</path>
 </list_code_definition_names>
 
+## plan_mode_respond
+Description: Respond in Plan Mode with a detailed plan or response. NEVER leave response empty.
+Parameters:
+- response: (required) Your detailed plan or response. Must not be empty.
+- options: (optional) Array of options for user to select.
+Usage:
+<plan_mode_respond>
+<response>
+Your detailed response or plan here. Must never be empty.
+</response>
+<options>
+[]
+</options>
+</plan_mode_respond>
+
 ## ask_followup_question
-Description: Ask the user a question to gather additional information.
+Description: Ask the user a clarifying question when more information is needed.
 Parameters:
 - question: (required) A clear, specific question.
+- options: (optional) Array of answer options.
 Usage:
 <ask_followup_question>
-<question>Your question here</question>
+<question>Your question here?</question>
+<options>["Option A", "Option B"]</options>
 </ask_followup_question>
 
 ## attempt_completion
-Description: Present the final result once the task is complete.
+Description: Present the final result to the user when the task is complete.
 Parameters:
-- result: (required) Final description of what was done.
+- result: (required) Description of what was accomplished.
 - command: (optional) CLI command to demo the result.
 Usage:
 <attempt_completion>
 <result>
-Your final result description here
+Description of completed task.
 </result>
 </attempt_completion>
 
 ====
 
 CRITICAL RULES:
-1. Output ONE tool call per response — NOTHING else before or after it
+1. ONE tool call per response — NOTHING before or after it
 2. NEVER wrap tool calls in markdown code blocks or backticks
-3. NEVER add citation numbers like [1][2][3] inside tool calls
-4. ALWAYS include ALL required parameters — especially <path> and <requires_approval>
-5. Use <thinking></thinking> tags internally to reason, but output only the tool call
-6. Read a file before editing it
-7. Wait for tool result before next tool call
-8. For execute_command, ALWAYS include <requires_approval>false</requires_approval> for safe commands"""
+3. NEVER add citation numbers [1][2][3] inside tool calls
+4. ALWAYS include ALL required parameters
+5. execute_command ALWAYS needs <requires_approval>false</requires_approval> (or true)
+6. write_to_file ALWAYS needs <path> and complete <content>
+7. plan_mode_respond ALWAYS needs non-empty <response>
+8. Read files before editing them
+9. Wait for tool result before issuing next tool call"""
 
 
 def resolve_mode(model: str) -> str:
     return MODE_MAP.get(model, "auto")
 
 
+async def fetch_image_as_base64(url: str) -> tuple[str, str]:
+    """Download image from URL and return (base64_data, mime_type)."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as hc:
+            resp = await hc.get(url)
+            mime = resp.headers.get("content-type", "image/png").split(";")[0]
+            b64  = base64.b64encode(resp.content).decode()
+            return b64, mime
+    except Exception:
+        return None, None
+
+
+async def content_to_str_async(content, include_images: bool = True) -> tuple[str, list]:
+    """
+    Convert content (str or list) to (text_string, image_urls_list).
+    Handles multimodal OpenAI content format with text + image_url blocks.
+    """
+    if isinstance(content, str):
+        return content, []
+
+    if isinstance(content, list):
+        text_parts  = []
+        image_items = []
+
+        for item in content:
+            if isinstance(item, str):
+                text_parts.append(item)
+            elif isinstance(item, dict):
+                t = item.get("type", "")
+                if t == "text":
+                    text_parts.append(item.get("text", ""))
+                elif t == "image_url":
+                    img = item.get("image_url", {})
+                    url = img.get("url", "") if isinstance(img, dict) else img
+
+                    if url.startswith("data:"):
+                        # Already base64 — extract mime and data
+                        header, data = url.split(",", 1)
+                        mime = header.split(":")[1].split(";")[0]
+                        image_items.append({"type": "base64", "mime": mime, "data": data})
+                        text_parts.append("[image attached]")
+                    elif url.startswith("http"):
+                        if include_images:
+                            b64, mime = await fetch_image_as_base64(url)
+                            if b64:
+                                image_items.append({"type": "base64", "mime": mime, "data": b64})
+                        text_parts.append(f"[image: {url}]")
+
+        return " ".join(text_parts), image_items
+
+    return str(content), []
+
+
 def content_to_str(content) -> str:
+    """Sync version — text only, no images."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -195,27 +266,26 @@ def content_to_str(content) -> str:
             if isinstance(item, str):
                 parts.append(item)
             elif isinstance(item, dict):
-                if item.get("type") == "text":
+                t = item.get("type", "")
+                if t == "text":
                     parts.append(item.get("text", ""))
-                elif item.get("type") == "image_url":
-                    parts.append("[image]")
-                else:
-                    parts.append(str(item))
+                elif t == "image_url":
+                    parts.append("[image attached]")
         return " ".join(parts)
     return str(content)
 
 
 def fix_cline_tool_calls(answer: str, messages: list) -> str:
-    """Post-process Perplexity response to fix malformed Cline XML tool calls."""
+    """Fix malformed Cline XML tool calls from Perplexity responses."""
 
-    # Strip markdown fences around tool calls
+    # Strip markdown fences wrapping tool calls
     answer = re.sub(r"```(?:xml)?\s*\n?(<[a-z_]+>)", r"\1", answer)
     answer = re.sub(r"(</[a-z_]+>)\s*\n?```", r"\1", answer)
 
-    # Strip citation numbers [1][2] that break XML
+    # Strip citation numbers [1][2]
     answer = re.sub(r"\[\d+\]", "", answer)
 
-    # Get last user message for filename inference
+    # Get last user message for context
     last_user_msg = ""
     for m in reversed(messages):
         if m.get("role") == "user":
@@ -228,7 +298,7 @@ def fix_cline_tool_calls(answer: str, messages: list) -> str:
             r"write\s+(?:to\s+)?(\S+\.\w+)",
             r"make\s+(?:a\s+)?(\S+\.\w+)",
             r"file\s+(?:called\s+|named\s+)?(\S+\.\w+)",
-            r"(\S+\.(?:md|txt|py|json|yaml|yml|js|ts|dart|sh|env|toml|cfg))",
+            r"(\S+\.(?:md|txt|py|json|yaml|yml|js|ts|dart|sh|env|toml|cfg|html|css))",
         ]
         for pattern in patterns:
             match = re.search(pattern, last_user_msg, re.IGNORECASE)
@@ -259,7 +329,6 @@ def fix_cline_tool_calls(answer: str, messages: list) -> str:
 
     # Fix execute_command missing <requires_approval>
     if "<execute_command>" in answer and "<requires_approval>" not in answer:
-        # Inject before closing tag
         answer = answer.replace(
             "</execute_command>",
             "<requires_approval>false</requires_approval>\n</execute_command>"
@@ -267,50 +336,95 @@ def fix_cline_tool_calls(answer: str, messages: list) -> str:
 
     # Fix search_files missing <path>
     if "<search_files>" in answer and "<path>" not in answer:
-        answer = answer.replace(
-            "<search_files>",
-            "<search_files>\n<path>.</path>"
-        )
+        answer = answer.replace("<search_files>", "<search_files>\n<path>.</path>")
 
     # Fix list_files missing <path>
     if "<list_files>" in answer and "<path>" not in answer:
+        answer = answer.replace("<list_files>", "<list_files>\n<path>.</path>")
+
+    # Fix plan_mode_respond with empty or missing <response>
+    if "<plan_mode_respond>" in answer:
+        if "<response>" not in answer:
+            text = re.sub(r"<[^>]+>", "", answer).strip()
+            if not text:
+                text = "I'll analyze the task and create a detailed plan."
+            answer = answer.replace(
+                "<plan_mode_respond>",
+                f"<plan_mode_respond>\n<response>{text}</response>"
+            )
+        # Fix empty response tag
+        answer = re.sub(
+            r"<response>\s*</response>",
+            "<response>I'll analyze the task and create a detailed plan.</response>",
+            answer
+        )
+
+    # Fix ask_followup_question missing <question>
+    if "<ask_followup_question>" in answer and "<question>" not in answer:
+        text = re.sub(r"<[^>]+>", "", answer).strip()
+        if not text:
+            text = "Could you provide more details about what you'd like me to do?"
         answer = answer.replace(
-            "<list_files>",
-            "<list_files>\n<path>.</path>"
+            "<ask_followup_question>",
+            f"<ask_followup_question>\n<question>{text}</question>"
+        )
+
+    # Fix attempt_completion missing <result>
+    if "<attempt_completion>" in answer and "<result>" not in answer:
+        text = re.sub(r"<[^>]+>", "", answer).strip()
+        if not text:
+            text = "Task completed successfully."
+        answer = answer.replace(
+            "<attempt_completion>",
+            f"<attempt_completion>\n<result>{text}</result>"
         )
 
     return answer.strip()
 
 
-def build_query(messages: list, tools: list = None) -> str:
+async def build_query_async(messages: list, tools: list = None) -> str:
+    """Build query string, extracting text + handling images from messages."""
     parts = []
+    all_images = []
 
     parts.append(CLINE_SYSTEM_PROMPT)
 
+    # System messages
     for m in messages:
         if m.get("role") == "system":
-            content = content_to_str(m.get("content", ""))
-            if content:
-                parts.append(f"[Additional instructions: {content}]")
+            text, _ = await content_to_str_async(m.get("content", ""), include_images=False)
+            if text:
+                parts.append(f"[Additional instructions: {text}]")
 
+    # Tool names
     if tools:
         tool_names = [t.get("function", {}).get("name", "") for t in tools if "function" in t]
         if tool_names:
             parts.append(f"[Available tools: {', '.join(tool_names)}]")
 
+    # Conversation messages
     for m in messages:
-        role    = m.get("role", "")
-        content = content_to_str(m.get("content", ""))
-        if not content:
+        role = m.get("role", "")
+        if role == "system":
+            continue
+        text, images = await content_to_str_async(m.get("content", ""))
+        all_images.extend(images)
+        if not text and not images:
             continue
         if role == "user":
-            parts.append(f"<user_message>\n{content}\n</user_message>")
+            parts.append(f"<user_message>\n{text}\n</user_message>")
         elif role == "assistant":
-            parts.append(f"<assistant_response>\n{content}\n</assistant_response>")
+            parts.append(f"<assistant_response>\n{text}\n</assistant_response>")
         elif role == "tool":
-            parts.append(f"<tool_result tool_call_id='{m.get('tool_call_id', '')}'>\n{content}\n</tool_result>")
+            parts.append(f"<tool_result tool_call_id='{m.get('tool_call_id', '')}'>\n{text}\n</tool_result>")
 
-    return "\n\n".join(parts)
+    query = "\n\n".join(parts)
+
+    # Append image descriptions if any
+    if all_images:
+        query += f"\n\n[Note: {len(all_images)} image(s) attached by user. Analyze and describe them as part of your response.]"
+
+    return query
 
 
 def extract_answer(result) -> str:
@@ -409,7 +523,8 @@ async def chat_completions(request: Request):
     if not messages:
         return JSONResponse({"error": "messages field is required"}, status_code=400)
 
-    query = build_query(messages, tools or None)
+    # Build query asynchronously (handles image fetching)
+    query = await build_query_async(messages, tools or None)
     mode  = resolve_mode(model)
 
     try:
