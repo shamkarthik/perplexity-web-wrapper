@@ -3,7 +3,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from lib.perplexity import Client
 from concurrent.futures import ThreadPoolExecutor
-import asyncio, json, uuid, time, re, base64, httpx
+import asyncio, json, uuid, time, re, base64, httpx, os, tempfile, traceback
 
 app = FastAPI()
 
@@ -15,6 +15,11 @@ if isinstance(cookies, list):
 
 client = Client(cookies)
 executor = ThreadPoolExecutor(max_workers=4)
+
+TMP_IMAGE_DIR = os.path.join(os.environ.get("TEMP", tempfile.gettempdir()), "cline_images")
+os.makedirs(TMP_IMAGE_DIR, exist_ok=True)
+
+# ─── Mode + Model Maps ────────────────────────────────────────────────────────
 
 MODE_MAP = {
     "auto":               "auto",
@@ -28,20 +33,70 @@ MODE_MAP = {
     "claude-3-7-sonnet":  "pro",
     "claude":             "pro",
     "sonnet":             "pro",
-    "gpt-4o":             "auto",
-    "gpt-4":              "auto",
-    "gpt-4-turbo":        "auto",
+    "gpt-4o":             "pro",
+    "gpt-4":              "pro",
+    "gpt-4-turbo":        "pro",
     "gpt-3.5-turbo":      "auto",
-    "gpt-5":              "auto",
+    "gpt-5":              "pro",
     "sonar":              "pro",
     "sonar-pro":          "pro",
     "coding":             "pro",
     "research":           "deep research",
     "writing":            "auto",
-    "default":            "auto",
+    "default":            "pro",
     "o1":                 "reasoning",
     "o3-mini":            "reasoning",
+    "r1":                 "reasoning",
 }
+
+WRAPPER_MODEL_MAP = {
+    "claude-sonnet-4-6":  "claude 3.7 sonnet",
+    "claude-sonnet-4-5":  "claude 3.7 sonnet",
+    "claude-3-7-sonnet":  "claude 3.7 sonnet",
+    "claude-3-5-sonnet":  "claude 3.7 sonnet",
+    "claude":             "claude 3.7 sonnet",
+    "sonnet":             "claude 3.7 sonnet",
+    "pro":                "claude 3.7 sonnet",
+    "default":            "claude 3.7 sonnet",
+    "coding":             "claude 3.7 sonnet",
+    "gpt-4o":             "gpt-4o",
+    "gpt-4":              "gpt-4o",
+    "gpt-4-turbo":        "gpt-4o",
+    "gpt-5":              "gpt-4o",
+    "gpt-4.5":            "gpt-4.5",
+    "sonar":              "sonar",
+    "sonar-pro":          "sonar",
+    "grok-2":             "grok-2",
+    "gemini":             "gemini 2.0 flash",
+    "o3-mini":            "o3-mini",
+    "r1":                 "r1",
+    "auto":               None,
+    "deep research":      None,
+    "deep_research":      None,
+    "reasoning":          None,
+    "writing":            None,
+    "research":           None,
+}
+
+MODE_ALLOWED_MODELS = {
+    "auto":          [None],
+    "pro":           [None, "sonar", "gpt-4.5", "gpt-4o", "claude 3.7 sonnet", "gemini 2.0 flash", "grok-2"],
+    "reasoning":     [None, "r1", "o3-mini", "claude 3.7 sonnet"],
+    "deep research": [None],
+}
+
+
+def resolve_mode(model: str) -> str:
+    return MODE_MAP.get(model, "pro")
+
+
+def resolve_wrapper_model(model: str, mode: str):
+    mapped  = WRAPPER_MODEL_MAP.get(model, "claude 3.7 sonnet")
+    allowed = MODE_ALLOWED_MODELS.get(mode, [None])
+    return mapped if mapped in allowed else None
+
+
+# ─── System Prompt ────────────────────────────────────────────────────────────
 
 CLINE_SYSTEM_PROMPT = """You are Cline, a highly skilled software engineer with extensive knowledge in many programming languages, frameworks, design patterns, and best practices.
 
@@ -68,7 +123,7 @@ Always adhere to this format. Output ONE tool call per response — nothing else
 Description: Execute a CLI command on the system.
 Parameters:
 - command: (required) The CLI command to execute.
-- requires_approval: (required) true or false. Use false for safe/read-only commands. Use true for installs, deletes, destructive ops.
+- requires_approval: (required) true or false. false for safe/read-only, true for installs/deletes/destructive.
 Usage:
 <execute_command>
 <command>your command here</command>
@@ -85,10 +140,10 @@ Usage:
 </read_file>
 
 ## write_to_file
-Description: Write content to a file at the specified path. Creates file if it doesn't exist. Always provide COMPLETE file content.
+Description: Write content to a file. Creates file if it doesn't exist. Always provide COMPLETE file content.
 Parameters:
 - path: (required) Path of file to write.
-- content: (required) Complete file content — never truncate or use placeholders.
+- content: (required) Complete file content — never truncate.
 Usage:
 <write_to_file>
 <path>path/to/file</path>
@@ -98,28 +153,28 @@ full file content here
 </write_to_file>
 
 ## replace_in_file
-Description: Make targeted edits to specific parts of a file using SEARCH/REPLACE blocks.
+Description: Make targeted edits to specific parts of a file.
 Parameters:
 - path: (required) Path of file to modify.
-- diff: (required) One or more SEARCH/REPLACE blocks.
+- diff: (required) SEARCH/REPLACE blocks.
 Usage:
 <replace_in_file>
 <path>path/to/file</path>
 <diff>
 <<<<<<< SEARCH
-old code to find
+old code
 =======
-new replacement code
+new code
 >>>>>>> REPLACE
 </diff>
 </replace_in_file>
 
 ## search_files
-Description: Perform a regex search across files in a directory.
+Description: Regex search across files in a directory.
 Parameters:
 - path: (required) Directory to search in.
-- regex: (required) Regex pattern to search for.
-- file_pattern: (optional) Glob pattern to filter files (e.g. *.py).
+- regex: (required) Regex pattern.
+- file_pattern: (optional) Glob pattern (e.g. *.py).
 Usage:
 <search_files>
 <path>.</path>
@@ -139,7 +194,7 @@ Usage:
 </list_files>
 
 ## list_code_definition_names
-Description: List top-level code definitions (classes, functions, methods) in a directory.
+Description: List top-level code definitions in a directory.
 Parameters:
 - path: (required) Directory path.
 Usage:
@@ -147,23 +202,8 @@ Usage:
 <path>.</path>
 </list_code_definition_names>
 
-## plan_mode_respond
-Description: Respond in Plan Mode with a detailed plan or response. NEVER leave response empty.
-Parameters:
-- response: (required) Your detailed plan or response. Must not be empty.
-- options: (optional) Array of options for user to select.
-Usage:
-<plan_mode_respond>
-<response>
-Your detailed response or plan here. Must never be empty.
-</response>
-<options>
-[]
-</options>
-</plan_mode_respond>
-
 ## ask_followup_question
-Description: Ask the user a clarifying question when more information is needed.
+Description: Ask the user a clarifying question.
 Parameters:
 - question: (required) A clear, specific question.
 - options: (optional) Array of answer options.
@@ -174,14 +214,14 @@ Usage:
 </ask_followup_question>
 
 ## attempt_completion
-Description: Present the final result to the user when the task is complete.
+Description: Present the final result when the task is complete or you have an answer.
 Parameters:
-- result: (required) Description of what was accomplished.
+- result: (required) Description of what was accomplished or your answer.
 - command: (optional) CLI command to demo the result.
 Usage:
 <attempt_completion>
 <result>
-Description of completed task.
+Description of completed task or answer here.
 </result>
 </attempt_completion>
 
@@ -192,41 +232,94 @@ CRITICAL RULES:
 2. NEVER wrap tool calls in markdown code blocks or backticks
 3. NEVER add citation numbers [1][2][3] inside tool calls
 4. ALWAYS include ALL required parameters
-5. execute_command ALWAYS needs <requires_approval>false</requires_approval> (or true)
+5. execute_command ALWAYS needs <requires_approval>
 6. write_to_file ALWAYS needs <path> and complete <content>
-7. plan_mode_respond ALWAYS needs non-empty <response>
-8. Read files before editing them
-9. Wait for tool result before issuing next tool call"""
+7. You are ALWAYS in Act mode — NEVER use plan_mode_respond
+8. If the task is complete or you have a direct answer, use attempt_completion
+9. Read files before editing them
+10. Wait for tool result before next tool call
+11. If an image is described in the message, analyze it and use attempt_completion to report findings"""
 
 
-def resolve_mode(model: str) -> str:
-    return MODE_MAP.get(model, "auto")
+# ─── Image Extraction (current message only) ─────────────────────────────────
+
+def extract_files_from_last_user_message(messages: list) -> dict:
+    """
+    Extract base64 images ONLY from the most recent user message.
+    Ignores all previous messages to avoid re-uploading old images.
+    Returns {filename: bytes} for client.search(files=...).
+    """
+    # Find the last user message
+    last_user_msg = None
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            last_user_msg = m
+            break
+
+    if not last_user_msg:
+        return {}
+
+    content = last_user_msg.get("content", "")
+    if not isinstance(content, list):
+        return {}
+
+    files = {}
+    idx = 0
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "image_url":
+            continue
+        img = item.get("image_url", {})
+        url = img.get("url", "") if isinstance(img, dict) else img
+        if not url.startswith("data:"):
+            continue
+        header, b64_data = url.split(",", 1)
+        mime     = header.split(":")[1].split(";")[0]
+        ext      = mime.split("/")[-1].replace("jpeg", "jpg")
+        filename = f"cline_image_{idx}.{ext}"
+        try:
+            files[filename] = base64.b64decode(b64_data)
+            print(f"[Image] Extracted {filename} ({len(files[filename])} bytes) from latest message")
+        except Exception as e:
+            print(f"[Image extract failed] {e}")
+        idx += 1
+
+    return files
 
 
-async def fetch_image_as_base64(url: str) -> tuple[str, str]:
-    """Download image from URL and return (base64_data, mime_type)."""
+# ─── Content Processing ───────────────────────────────────────────────────────
+
+async def fetch_remote_image(url: str) -> tuple[str, str] | tuple[None, None]:
     try:
         async with httpx.AsyncClient(timeout=10) as hc:
-            resp = await hc.get(url)
-            mime = resp.headers.get("content-type", "image/png").split(";")[0]
-            b64  = base64.b64encode(resp.content).decode()
-            return b64, mime
-    except Exception:
+            r = await hc.get(url)
+            mime = r.headers.get("content-type", "image/png").split(";")[0]
+            return base64.b64encode(r.content).decode(), mime
+    except Exception as e:
+        print(f"[Image fetch failed] {e}")
         return None, None
 
 
-async def content_to_str_async(content, include_images: bool = True) -> tuple[str, list]:
-    """
-    Convert content (str or list) to (text_string, image_urls_list).
-    Handles multimodal OpenAI content format with text + image_url blocks.
-    """
+async def save_image_locally(b64_data: str, mime: str) -> str | None:
+    try:
+        ext      = mime.split("/")[-1].replace("jpeg", "jpg")
+        filename = os.path.join(TMP_IMAGE_DIR, f"img_{uuid.uuid4().hex[:8]}.{ext}")
+        with open(filename, "wb") as f:
+            f.write(base64.b64decode(b64_data))
+        return filename
+    except Exception as e:
+        print(f"[Image save failed] {e}")
+        return None
+
+
+async def process_message_content(content) -> tuple[str, list[str]]:
+    """Process content list → (text, [image_paths]). Images noted as [IMAGE: path]."""
     if isinstance(content, str):
         return content, []
-
     if isinstance(content, list):
         text_parts  = []
-        image_items = []
-
+        image_paths = []
         for item in content:
             if isinstance(item, str):
                 text_parts.append(item)
@@ -237,27 +330,31 @@ async def content_to_str_async(content, include_images: bool = True) -> tuple[st
                 elif t == "image_url":
                     img = item.get("image_url", {})
                     url = img.get("url", "") if isinstance(img, dict) else img
-
                     if url.startswith("data:"):
-                        # Already base64 — extract mime and data
-                        header, data = url.split(",", 1)
-                        mime = header.split(":")[1].split(";")[0]
-                        image_items.append({"type": "base64", "mime": mime, "data": data})
-                        text_parts.append("[image attached]")
+                        header, b64_data = url.split(",", 1)
+                        mime       = header.split(":")[1].split(";")[0]
+                        local_path = await save_image_locally(b64_data, mime)
+                        if local_path:
+                            image_paths.append(local_path)
+                            text_parts.append(f"[IMAGE: {local_path}]")
+                        else:
+                            text_parts.append("[image could not be saved]")
                     elif url.startswith("http"):
-                        if include_images:
-                            b64, mime = await fetch_image_as_base64(url)
-                            if b64:
-                                image_items.append({"type": "base64", "mime": mime, "data": b64})
-                        text_parts.append(f"[image: {url}]")
-
-        return " ".join(text_parts), image_items
-
+                        b64_data, mime = await fetch_remote_image(url)
+                        if b64_data:
+                            local_path = await save_image_locally(b64_data, mime)
+                            if local_path:
+                                image_paths.append(local_path)
+                                text_parts.append(f"[IMAGE: {local_path}]")
+                            else:
+                                text_parts.append(f"[image url: {url}]")
+                        else:
+                            text_parts.append(f"[image url: {url}]")
+        return " ".join(text_parts), image_paths
     return str(content), []
 
 
 def content_to_str(content) -> str:
-    """Sync version — text only, no images."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -270,22 +367,20 @@ def content_to_str(content) -> str:
                 if t == "text":
                     parts.append(item.get("text", ""))
                 elif t == "image_url":
-                    parts.append("[image attached]")
+                    parts.append("[image]")
         return " ".join(parts)
     return str(content)
 
 
-def fix_cline_tool_calls(answer: str, messages: list) -> str:
-    """Fix malformed Cline XML tool calls from Perplexity responses."""
+# ─── Tool Call Fixer ──────────────────────────────────────────────────────────
 
-    # Strip markdown fences wrapping tool calls
+def fix_cline_tool_calls(answer: str, messages: list) -> str:
+    # Strip markdown fences around tool calls
     answer = re.sub(r"```(?:xml)?\s*\n?(<[a-z_]+>)", r"\1", answer)
     answer = re.sub(r"(</[a-z_]+>)\s*\n?```", r"\1", answer)
-
-    # Strip citation numbers [1][2]
+    # Strip citation numbers
     answer = re.sub(r"\[\d+\]", "", answer)
 
-    # Get last user message for context
     last_user_msg = ""
     for m in reversed(messages):
         if m.get("role") == "user":
@@ -293,123 +388,89 @@ def fix_cline_tool_calls(answer: str, messages: list) -> str:
             break
 
     def infer_filename(fallback="output.md") -> str:
-        patterns = [
+        for pattern in [
             r"create\s+(?:a\s+)?(\S+\.\w+)",
             r"write\s+(?:to\s+)?(\S+\.\w+)",
             r"make\s+(?:a\s+)?(\S+\.\w+)",
             r"file\s+(?:called\s+|named\s+)?(\S+\.\w+)",
             r"(\S+\.(?:md|txt|py|json|yaml|yml|js|ts|dart|sh|env|toml|cfg|html|css))",
-        ]
-        for pattern in patterns:
+        ]:
             match = re.search(pattern, last_user_msg, re.IGNORECASE)
             if match:
                 return match.group(1)
         return fallback
 
-    # Fix write_to_file missing <path>
+    # Fix missing required params per tool
     if "<write_to_file>" in answer and "<path>" not in answer:
-        answer = answer.replace(
-            "<write_to_file>",
-            f"<write_to_file>\n<path>{infer_filename('output.md')}</path>"
-        )
-
-    # Fix read_file missing <path>
+        answer = answer.replace("<write_to_file>",
+            f"<write_to_file>\n<path>{infer_filename('output.md')}</path>")
     if "<read_file>" in answer and "<path>" not in answer:
-        answer = answer.replace(
-            "<read_file>",
-            "<read_file>\n<path>openai_server.py</path>"
-        )
-
-    # Fix replace_in_file missing <path>
+        answer = answer.replace("<read_file>",
+            "<read_file>\n<path>openai_server.py</path>")
     if "<replace_in_file>" in answer and "<path>" not in answer:
-        answer = answer.replace(
-            "<replace_in_file>",
-            f"<replace_in_file>\n<path>{infer_filename('openai_server.py')}</path>"
-        )
-
-    # Fix execute_command missing <requires_approval>
+        answer = answer.replace("<replace_in_file>",
+            f"<replace_in_file>\n<path>{infer_filename('openai_server.py')}</path>")
     if "<execute_command>" in answer and "<requires_approval>" not in answer:
-        answer = answer.replace(
-            "</execute_command>",
-            "<requires_approval>false</requires_approval>\n</execute_command>"
-        )
-
-    # Fix search_files missing <path>
+        answer = answer.replace("</execute_command>",
+            "<requires_approval>false</requires_approval>\n</execute_command>")
     if "<search_files>" in answer and "<path>" not in answer:
         answer = answer.replace("<search_files>", "<search_files>\n<path>.</path>")
-
-    # Fix list_files missing <path>
     if "<list_files>" in answer and "<path>" not in answer:
         answer = answer.replace("<list_files>", "<list_files>\n<path>.</path>")
 
-    # Fix plan_mode_respond with empty or missing <response>
+    # Fix plan_mode_respond if model used it despite instructions (fix params only, don't create it)
     if "<plan_mode_respond>" in answer:
         if "<response>" not in answer:
-            text = re.sub(r"<[^>]+>", "", answer).strip()
-            if not text:
-                text = "I'll analyze the task and create a detailed plan."
-            answer = answer.replace(
-                "<plan_mode_respond>",
-                f"<plan_mode_respond>\n<response>{text}</response>"
-            )
-        # Fix empty response tag
-        answer = re.sub(
-            r"<response>\s*</response>",
-            "<response>I'll analyze the task and create a detailed plan.</response>",
-            answer
-        )
+            text = re.sub(r"<[^>]+>", "", answer).strip() or "Here is my analysis."
+            answer = answer.replace("<plan_mode_respond>",
+                f"<plan_mode_respond>\n<response>{text}</response>")
+        answer = re.sub(r"<response>\s*</response>",
+            "<response>Here is my analysis.</response>", answer)
 
-    # Fix ask_followup_question missing <question>
     if "<ask_followup_question>" in answer and "<question>" not in answer:
-        text = re.sub(r"<[^>]+>", "", answer).strip()
-        if not text:
-            text = "Could you provide more details about what you'd like me to do?"
-        answer = answer.replace(
-            "<ask_followup_question>",
-            f"<ask_followup_question>\n<question>{text}</question>"
-        )
+        text = re.sub(r"<[^>]+>", "", answer).strip() or "Could you provide more details?"
+        answer = answer.replace("<ask_followup_question>",
+            f"<ask_followup_question>\n<question>{text}</question>")
 
-    # Fix attempt_completion missing <result>
     if "<attempt_completion>" in answer and "<result>" not in answer:
-        text = re.sub(r"<[^>]+>", "", answer).strip()
-        if not text:
-            text = "Task completed successfully."
-        answer = answer.replace(
-            "<attempt_completion>",
-            f"<attempt_completion>\n<result>{text}</result>"
-        )
+        text = re.sub(r"<[^>]+>", "", answer).strip() or "Task completed successfully."
+        answer = answer.replace("<attempt_completion>",
+            f"<attempt_completion>\n<result>{text}</result>")
+
+    # If no known tool tag at all → wrap as attempt_completion (shows in chat, NOT plan)
+    known_tools = [
+        "<execute_command>", "<read_file>", "<write_to_file>", "<replace_in_file>",
+        "<search_files>", "<list_files>", "<list_code_definition_names>",
+        "<plan_mode_respond>", "<ask_followup_question>", "<attempt_completion>",
+    ]
+    if not any(tag in answer for tag in known_tools):
+        answer = f"<attempt_completion>\n<result>\n{answer.strip()}\n</result>\n</attempt_completion>"
 
     return answer.strip()
 
 
+# ─── Query Builder ────────────────────────────────────────────────────────────
+
 async def build_query_async(messages: list, tools: list = None) -> str:
-    """Build query string, extracting text + handling images from messages."""
-    parts = []
-    all_images = []
+    parts = [CLINE_SYSTEM_PROMPT]
 
-    parts.append(CLINE_SYSTEM_PROMPT)
-
-    # System messages
     for m in messages:
         if m.get("role") == "system":
-            text, _ = await content_to_str_async(m.get("content", ""), include_images=False)
+            text, _ = await process_message_content(m.get("content", ""))
             if text:
                 parts.append(f"[Additional instructions: {text}]")
 
-    # Tool names
     if tools:
         tool_names = [t.get("function", {}).get("name", "") for t in tools if "function" in t]
         if tool_names:
             parts.append(f"[Available tools: {', '.join(tool_names)}]")
 
-    # Conversation messages
     for m in messages:
         role = m.get("role", "")
         if role == "system":
             continue
-        text, images = await content_to_str_async(m.get("content", ""))
-        all_images.extend(images)
-        if not text and not images:
+        text, _ = await process_message_content(m.get("content", ""))
+        if not text:
             continue
         if role == "user":
             parts.append(f"<user_message>\n{text}\n</user_message>")
@@ -418,37 +479,39 @@ async def build_query_async(messages: list, tools: list = None) -> str:
         elif role == "tool":
             parts.append(f"<tool_result tool_call_id='{m.get('tool_call_id', '')}'>\n{text}\n</tool_result>")
 
-    query = "\n\n".join(parts)
+    return "\n\n".join(parts)
 
-    # Append image descriptions if any
-    if all_images:
-        query += f"\n\n[Note: {len(all_images)} image(s) attached by user. Analyze and describe them as part of your response.]"
 
-    return query
-
+# ─── Response Extractor ───────────────────────────────────────────────────────
 
 def extract_answer(result) -> str:
     if not isinstance(result, dict):
         return str(result)
 
-    blocks = result.get("blocks", [])
-    for block in blocks:
+    # SSE REST format: result["text"] is already a parsed dict
+    text = result.get("text")
+    if isinstance(text, dict):
+        answer = text.get("answer", "")
+        if answer:
+            return answer
+
+    # Fallback: blocks format
+    for block in result.get("blocks", []):
         mb = block.get("markdown_block")
         if mb and mb.get("answer"):
             return mb["answer"]
 
+    # Fallback: text steps list (old websocket format)
     text_steps = result.get("text", [])
     if isinstance(text_steps, list):
         for step in reversed(text_steps):
             if isinstance(step, dict) and step.get("step_type") == "FINAL":
-                content = step.get("content", {})
-                raw_answer = content.get("answer", "")
-                if raw_answer:
+                raw = step.get("content", {}).get("answer", "")
+                if raw:
                     try:
-                        parsed = json.loads(raw_answer)
-                        return parsed.get("answer", raw_answer)
+                        return json.loads(raw).get("answer", raw)
                     except Exception:
-                        return raw_answer
+                        return raw
 
     return json.dumps(result)
 
@@ -469,25 +532,17 @@ def make_chunk(content: str, model: str, finish: bool = False) -> str:
 
 def timeout_response(model: str) -> dict:
     return {
-        "id":      f"chatcmpl-{uuid.uuid4().hex[:8]}",
-        "object":  "chat.completion",
-        "created": int(time.time()),
-        "model":   model,
-        "choices": [{
-            "index": 0,
-            "message": {
-                "role":    "assistant",
-                "content": "⚠️ Request timed out. Perplexity took too long. Please try again."
-            },
-            "finish_reason": "stop"
-        }],
+        "id": f"chatcmpl-{uuid.uuid4().hex[:8]}", "object": "chat.completion",
+        "created": int(time.time()), "model": model,
+        "choices": [{"index": 0, "message": {
+            "role": "assistant",
+            "content": "⚠️ Request timed out. Please try again."
+        }, "finish_reason": "stop"}],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     }
 
 
-# ─────────────────────────────────────────────
-# Routes
-# ─────────────────────────────────────────────
+# ─── Routes ───────────────────────────────────────────────────────────────────
 
 @app.get("/")
 async def root():
@@ -496,16 +551,13 @@ async def root():
 
 @app.get("/v1/models")
 async def list_models():
-    return JSONResponse({
-        "object": "list",
-        "data": [
-            {"id": "auto",             "object": "model", "owned_by": "perplexity"},
-            {"id": "pro",              "object": "model", "owned_by": "perplexity"},
-            {"id": "reasoning",        "object": "model", "owned_by": "perplexity"},
-            {"id": "deep research",    "object": "model", "owned_by": "perplexity"},
-            {"id": "claude-sonnet-4-6","object": "model", "owned_by": "perplexity"},
-        ]
-    })
+    return JSONResponse({"object": "list", "data": [
+        {"id": "claude-sonnet-4-6", "object": "model", "owned_by": "perplexity"},
+        {"id": "auto",              "object": "model", "owned_by": "perplexity"},
+        {"id": "pro",               "object": "model", "owned_by": "perplexity"},
+        {"id": "reasoning",         "object": "model", "owned_by": "perplexity"},
+        {"id": "deep research",     "object": "model", "owned_by": "perplexity"},
+    ]})
 
 
 @app.post("/v1/chat/completions")
@@ -516,29 +568,46 @@ async def chat_completions(request: Request):
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
 
     messages = body.get("messages", [])
-    model    = body.get("model", "auto")
+    model    = body.get("model", "claude-sonnet-4-6")
     stream   = body.get("stream", False)
     tools    = body.get("tools", [])
 
     if not messages:
         return JSONResponse({"error": "messages field is required"}, status_code=400)
 
-    # Build query asynchronously (handles image fetching)
-    query = await build_query_async(messages, tools or None)
-    mode  = resolve_mode(model)
+    # ── Resolve mode + wrapper model ─────────────────────────────────────────
+    mode          = resolve_mode(model)
+    wrapper_model = resolve_wrapper_model(model, mode)
+    print(f"[Request] model={model} → mode={mode}, wrapper_model={wrapper_model}")
 
+    # ── Extract images from LATEST user message only ──────────────────────────
+    files = extract_files_from_last_user_message(messages)
+    if files:
+        print(f"[Images] {len(files)} image(s) from latest message → uploading via S3")
+
+    # ── Build text query (all messages for context) ───────────────────────────
+    query = await build_query_async(messages, tools or None)
+
+    # ── Call wrapper ──────────────────────────────────────────────────────────
     try:
-        loop   = asyncio.get_event_loop()
+        loop = asyncio.get_event_loop()
         result = await asyncio.wait_for(
             loop.run_in_executor(
                 executor,
-                lambda: client.search(query, mode=mode)
+                lambda: client.search(
+                    query,
+                    mode=mode,
+                    model=wrapper_model,
+                    files=files,           # ← only current message's images
+                    stream=False,
+                )
             ),
-            timeout=90.0
+            timeout=120.0
         )
     except asyncio.TimeoutError:
         return JSONResponse(timeout_response(model))
     except Exception as e:
+        traceback.print_exc()
         return JSONResponse({"error": str(e)}, status_code=500)
 
     answer = extract_answer(result)
@@ -552,7 +621,6 @@ async def chat_completions(request: Request):
                 yield f"data: {make_chunk(chunk, model)}\n\n"
             yield f"data: {make_chunk('', model, finish=True)}\n\n"
             yield "data: [DONE]\n\n"
-
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     return JSONResponse({
@@ -560,14 +628,9 @@ async def chat_completions(request: Request):
         "object":  "chat.completion",
         "created": int(time.time()),
         "model":   model,
-        "choices": [{
-            "index": 0,
-            "message": {
-                "role":    "assistant",
-                "content": answer
-            },
-            "finish_reason": "stop"
-        }],
+        "choices": [{"index": 0, "message": {
+            "role": "assistant", "content": answer
+        }, "finish_reason": "stop"}],
         "usage": {
             "prompt_tokens":     len(query.split()),
             "completion_tokens": len(answer.split()),
