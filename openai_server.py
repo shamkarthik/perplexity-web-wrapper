@@ -49,18 +49,64 @@ def resolve_mode(model: str) -> str:
     return MODE_MAP.get(model, "auto")
 
 
+def content_to_str(content) -> str:
+    """Handle content as str, list of dicts (multimodal), or anything else."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                if item.get("type") == "text":
+                    parts.append(item.get("text", ""))
+                elif item.get("type") == "image_url":
+                    parts.append("[image]")
+                else:
+                    parts.append(str(item))
+        return " ".join(parts)
+    return str(content)
+
+
+def build_query(messages: list, tools: list = None) -> str:
+    parts = []
+
+    if tools:
+        tool_names = [t.get("function", {}).get("name", "") for t in tools if "function" in t]
+        if tool_names:
+            parts.append(f"[Available tools: {', '.join(tool_names)}]")
+            parts.append("[Use these tools by describing what to call and with what arguments.]")
+
+    for m in messages:
+        role    = m.get("role", "")
+        content = content_to_str(m.get("content", ""))
+        if not content:
+            continue
+        if role == "system":
+            parts.append(f"[System: {content}]")
+        elif role == "user":
+            parts.append(content)
+        elif role == "assistant":
+            parts.append(f"[Assistant: {content}]")
+        elif role == "tool":
+            parts.append(f"[Tool result ({m.get('tool_call_id', '')}): {content}]")
+
+    return "\n".join(parts)
+
+
 def extract_answer(result) -> str:
     if not isinstance(result, dict):
         return str(result)
 
-    # 1. Best path: blocks -> markdown_block -> answer
+    # 1. Best: blocks -> markdown_block -> answer
     blocks = result.get("blocks", [])
     for block in blocks:
         mb = block.get("markdown_block")
         if mb and mb.get("answer"):
             return mb["answer"]
 
-    # 2. Fallback: text steps -> FINAL step -> content -> answer (JSON string)
+    # 2. Fallback: text steps -> FINAL step -> content -> answer
     text_steps = result.get("text", [])
     if isinstance(text_steps, list):
         for step in reversed(text_steps):
@@ -76,33 +122,6 @@ def extract_answer(result) -> str:
 
     # 3. Last resort
     return json.dumps(result)
-
-
-def build_query(messages: list, tools: list = None) -> str:
-    parts = []
-
-    # Mention available tools so Perplexity is aware of context
-    if tools:
-        tool_names = [t.get("function", {}).get("name", "") for t in tools if "function" in t]
-        if tool_names:
-            parts.append(f"[Available tools: {', '.join(tool_names)}]")
-            parts.append("[Use these tools by describing what to call and with what arguments.]")
-
-    for m in messages:
-        role    = m.get("role", "")
-        content = m.get("content", "")
-        if not content:
-            continue
-        if role == "system":
-            parts.append(f"[System: {content}]")
-        elif role == "user":
-            parts.append(content)
-        elif role == "assistant":
-            parts.append(f"[Assistant: {content}]")
-        elif role == "tool":
-            parts.append(f"[Tool result ({m.get('tool_call_id', '')}): {content}]")
-
-    return "\n".join(parts)
 
 
 def make_chunk(content: str, model: str, finish: bool = False) -> str:
@@ -137,9 +156,9 @@ def timeout_response(model: str) -> dict:
     }
 
 
-# ──────────────────────────────────────────────
+# ─────────────────────────────────────────────
 # Routes
-# ──────────────────────────────────────────────
+# ─────────────────────────────────────────────
 
 @app.get("/")
 async def root():
@@ -178,7 +197,6 @@ async def chat_completions(request: Request):
     query = build_query(messages, tools or None)
     mode  = resolve_mode(model)
 
-    # Run blocking client.search in thread pool with timeout
     try:
         loop   = asyncio.get_event_loop()
         result = await asyncio.wait_for(
@@ -222,8 +240,8 @@ async def chat_completions(request: Request):
             "finish_reason": "stop"
         }],
         "usage": {
-            "prompt_tokens":      len(query.split()),
-            "completion_tokens":  len(answer.split()),
-            "total_tokens":       len(query.split()) + len(answer.split())
+            "prompt_tokens":     len(query.split()),
+            "completion_tokens": len(answer.split()),
+            "total_tokens":      len(query.split()) + len(answer.split())
         }
     })
