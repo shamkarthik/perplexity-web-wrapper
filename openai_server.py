@@ -7,7 +7,6 @@ import asyncio, json, uuid, time
 
 app = FastAPI()
 
-# Load and normalize cookies
 with open("perplexity_cookies.json") as f:
     cookies = json.load(f)
 
@@ -44,13 +43,61 @@ MODE_MAP = {
     "o3-mini":            "reasoning",
 }
 
+# Cline agent system prompt injected into every request
+CLINE_SYSTEM_PROMPT = """You are Cline, an expert software engineer and coding agent.
+
+CRITICAL RULES — follow exactly:
+1. When you need to read a file, respond ONLY with:
+<read_file>
+<path>path/to/file</path>
+</read_file>
+
+2. When you need to write/create a file, respond ONLY with:
+<write_to_file>
+<path>path/to/file</path>
+<content>
+full file content here
+</content>
+</write_to_file>
+
+3. When you need to run a terminal command, respond ONLY with:
+<execute_command>
+<command>the command</command>
+</execute_command>
+
+4. When you need to search/replace code in a file, respond ONLY with:
+<replace_in_file>
+<path>path/to/file</path>
+<diff>
+<<<<<<< SEARCH
+old code
+=======
+new code
+>>>>>>> REPLACE
+</diff>
+</replace_in_file>
+
+5. When you need to ask the user a question, respond ONLY with:
+<ask_followup_question>
+<question>your question</question>
+</ask_followup_question>
+
+6. When the task is complete, respond ONLY with:
+<attempt_completion>
+<result>description of what was done</result>
+</attempt_completion>
+
+7. NEVER add markdown, explanations, or text before/after a tool call block.
+8. ONE tool call per response. Wait for result before next tool call.
+9. Think step by step, use tools to gather info before making changes.
+10. Always read a file before editing it."""
+
 
 def resolve_mode(model: str) -> str:
     return MODE_MAP.get(model, "auto")
 
 
 def content_to_str(content) -> str:
-    """Handle content as str, list of dicts (multimodal), or anything else."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -72,41 +119,50 @@ def content_to_str(content) -> str:
 def build_query(messages: list, tools: list = None) -> str:
     parts = []
 
-    if tools:
-        tool_names = [t.get("function", {}).get("name", "") for t in tools if "function" in t]
-        if tool_names:
-            parts.append(f"[Available tools: {', '.join(tool_names)}]")
-            parts.append("[Use these tools by describing what to call and with what arguments.]")
+    # Always inject Cline system prompt first
+    parts.append(CLINE_SYSTEM_PROMPT)
 
+    # Extract and append original system message if any
     for m in messages:
         role    = m.get("role", "")
         content = content_to_str(m.get("content", ""))
         if not content:
             continue
         if role == "system":
-            parts.append(f"[System: {content}]")
-        elif role == "user":
-            parts.append(content)
-        elif role == "assistant":
-            parts.append(f"[Assistant: {content}]")
-        elif role == "tool":
-            parts.append(f"[Tool result ({m.get('tool_call_id', '')}): {content}]")
+            parts.append(f"[Additional instructions: {content}]")
 
-    return "\n".join(parts)
+    # Add tool definitions as context
+    if tools:
+        tool_names = [t.get("function", {}).get("name", "") for t in tools if "function" in t]
+        if tool_names:
+            parts.append(f"[Available tools: {', '.join(tool_names)}]")
+
+    # Add conversation history
+    for m in messages:
+        role    = m.get("role", "")
+        content = content_to_str(m.get("content", ""))
+        if not content:
+            continue
+        if role == "user":
+            parts.append(f"<user_message>\n{content}\n</user_message>")
+        elif role == "assistant":
+            parts.append(f"<assistant_response>\n{content}\n</assistant_response>")
+        elif role == "tool":
+            parts.append(f"<tool_result tool_call_id='{m.get('tool_call_id', '')}'>\n{content}\n</tool_result>")
+
+    return "\n\n".join(parts)
 
 
 def extract_answer(result) -> str:
     if not isinstance(result, dict):
         return str(result)
 
-    # 1. Best: blocks -> markdown_block -> answer
     blocks = result.get("blocks", [])
     for block in blocks:
         mb = block.get("markdown_block")
         if mb and mb.get("answer"):
             return mb["answer"]
 
-    # 2. Fallback: text steps -> FINAL step -> content -> answer
     text_steps = result.get("text", [])
     if isinstance(text_steps, list):
         for step in reversed(text_steps):
@@ -120,7 +176,6 @@ def extract_answer(result) -> str:
                     except Exception:
                         return raw_answer
 
-    # 3. Last resort
     return json.dumps(result)
 
 
@@ -213,7 +268,7 @@ async def chat_completions(request: Request):
 
     answer = extract_answer(result)
 
-    # ── Streaming response ──
+    # ── Streaming ──
     if stream:
         def event_stream():
             words = answer.split(" ")
@@ -225,7 +280,7 @@ async def chat_completions(request: Request):
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-    # ── Standard JSON response ──
+    # ── Standard ──
     return JSONResponse({
         "id":      f"chatcmpl-{uuid.uuid4().hex[:8]}",
         "object":  "chat.completion",
