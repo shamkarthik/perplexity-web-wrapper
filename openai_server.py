@@ -203,7 +203,7 @@ Usage:
 </list_code_definition_names>
 
 ## ask_followup_question
-Description: Ask the user a clarifying question.
+Description: Ask the user a clarifying question when you need more information.
 Parameters:
 - question: (required) A clear, specific question.
 - options: (optional) Array of answer options.
@@ -214,14 +214,14 @@ Usage:
 </ask_followup_question>
 
 ## attempt_completion
-Description: Present the final result when the task is complete or you have an answer.
+Description: Present the final result ONLY when all work is fully done.
 Parameters:
-- result: (required) Description of what was accomplished or your answer.
+- result: (required) Description of what was accomplished.
 - command: (optional) CLI command to demo the result.
 Usage:
 <attempt_completion>
 <result>
-Description of completed task or answer here.
+Description of completed task.
 </result>
 </attempt_completion>
 
@@ -235,13 +235,15 @@ CRITICAL RULES:
 5. execute_command ALWAYS needs <requires_approval>
 6. write_to_file ALWAYS needs <path> and complete <content>
 7. You are ALWAYS in Act mode — NEVER use plan_mode_respond
-8. If the task is complete or you have a direct answer, use attempt_completion
-9. Read files before editing them
-10. Wait for tool result before next tool call
-11. If an image is described in the message, analyze it and use attempt_completion to report findings"""
+8. NEVER describe what you are going to do — just DO it with a tool call
+9. NEVER use attempt_completion until ALL actual work is fully done and verified
+10. Read files before editing them
+11. Wait for tool result before next tool call
+12. Your FIRST response to any task must be a concrete tool call — not a description or plan
+13. If images are provided, describe them inside attempt_completion result"""
 
 
-# ─── Image Extraction (current message only) ─────────────────────────────────
+# ─── Image Extraction (latest user message only) ─────────────────────────────
 
 def extract_files_from_last_user_message(messages: list) -> dict:
     """
@@ -249,7 +251,6 @@ def extract_files_from_last_user_message(messages: list) -> dict:
     Ignores all previous messages to avoid re-uploading old images.
     Returns {filename: bytes} for client.search(files=...).
     """
-    # Find the last user message
     last_user_msg = None
     for m in reversed(messages):
         if m.get("role") == "user":
@@ -270,8 +271,8 @@ def extract_files_from_last_user_message(messages: list) -> dict:
             continue
         if item.get("type") != "image_url":
             continue
-        img = item.get("image_url", {})
-        url = img.get("url", "") if isinstance(img, dict) else img
+        img  = item.get("image_url", {})
+        url  = img.get("url", "") if isinstance(img, dict) else img
         if not url.startswith("data:"):
             continue
         header, b64_data = url.split(",", 1)
@@ -293,7 +294,7 @@ def extract_files_from_last_user_message(messages: list) -> dict:
 async def fetch_remote_image(url: str) -> tuple[str, str] | tuple[None, None]:
     try:
         async with httpx.AsyncClient(timeout=10) as hc:
-            r = await hc.get(url)
+            r    = await hc.get(url)
             mime = r.headers.get("content-type", "image/png").split(";")[0]
             return base64.b64encode(r.content).decode(), mime
     except Exception as e:
@@ -314,7 +315,7 @@ async def save_image_locally(b64_data: str, mime: str) -> str | None:
 
 
 async def process_message_content(content) -> tuple[str, list[str]]:
-    """Process content list → (text, [image_paths]). Images noted as [IMAGE: path]."""
+    """Process content → (text, [image_paths])."""
     if isinstance(content, str):
         return content, []
     if isinstance(content, list):
@@ -374,11 +375,18 @@ def content_to_str(content) -> str:
 
 # ─── Tool Call Fixer ──────────────────────────────────────────────────────────
 
+KNOWN_TOOLS = [
+    "<execute_command>", "<read_file>", "<write_to_file>", "<replace_in_file>",
+    "<search_files>", "<list_files>", "<list_code_definition_names>",
+    "<plan_mode_respond>", "<ask_followup_question>", "<attempt_completion>",
+]
+
+
 def fix_cline_tool_calls(answer: str, messages: list) -> str:
     # Strip markdown fences around tool calls
     answer = re.sub(r"```(?:xml)?\s*\n?(<[a-z_]+>)", r"\1", answer)
     answer = re.sub(r"(</[a-z_]+>)\s*\n?```", r"\1", answer)
-    # Strip citation numbers
+    # Strip citation numbers [1][2]
     answer = re.sub(r"\[\d+\]", "", answer)
 
     last_user_msg = ""
@@ -400,7 +408,7 @@ def fix_cline_tool_calls(answer: str, messages: list) -> str:
                 return match.group(1)
         return fallback
 
-    # Fix missing required params per tool
+    # ── Fix missing required params ───────────────────────────────────────────
     if "<write_to_file>" in answer and "<path>" not in answer:
         answer = answer.replace("<write_to_file>",
             f"<write_to_file>\n<path>{infer_filename('output.md')}</path>")
@@ -417,8 +425,14 @@ def fix_cline_tool_calls(answer: str, messages: list) -> str:
         answer = answer.replace("<search_files>", "<search_files>\n<path>.</path>")
     if "<list_files>" in answer and "<path>" not in answer:
         answer = answer.replace("<list_files>", "<list_files>\n<path>.</path>")
-
-    # Fix plan_mode_respond if model used it despite instructions (fix params only, don't create it)
+    if "<ask_followup_question>" in answer and "<question>" not in answer:
+        text = re.sub(r"<[^>]+>", "", answer).strip() or "Could you provide more details?"
+        answer = answer.replace("<ask_followup_question>",
+            f"<ask_followup_question>\n<question>{text}</question>")
+    if "<attempt_completion>" in answer and "<result>" not in answer:
+        text = re.sub(r"<[^>]+>", "", answer).strip() or "Task completed successfully."
+        answer = answer.replace("<attempt_completion>",
+            f"<attempt_completion>\n<result>{text}</result>")
     if "<plan_mode_respond>" in answer:
         if "<response>" not in answer:
             text = re.sub(r"<[^>]+>", "", answer).strip() or "Here is my analysis."
@@ -427,24 +441,31 @@ def fix_cline_tool_calls(answer: str, messages: list) -> str:
         answer = re.sub(r"<response>\s*</response>",
             "<response>Here is my analysis.</response>", answer)
 
-    if "<ask_followup_question>" in answer and "<question>" not in answer:
-        text = re.sub(r"<[^>]+>", "", answer).strip() or "Could you provide more details?"
-        answer = answer.replace("<ask_followup_question>",
-            f"<ask_followup_question>\n<question>{text}</question>")
-
-    if "<attempt_completion>" in answer and "<result>" not in answer:
-        text = re.sub(r"<[^>]+>", "", answer).strip() or "Task completed successfully."
-        answer = answer.replace("<attempt_completion>",
-            f"<attempt_completion>\n<result>{text}</result>")
-
-    # If no known tool tag at all → wrap as attempt_completion (shows in chat, NOT plan)
-    known_tools = [
-        "<execute_command>", "<read_file>", "<write_to_file>", "<replace_in_file>",
-        "<search_files>", "<list_files>", "<list_code_definition_names>",
-        "<plan_mode_respond>", "<ask_followup_question>", "<attempt_completion>",
-    ]
-    if not any(tag in answer for tag in known_tools):
-        answer = f"<attempt_completion>\n<result>\n{answer.strip()}\n</result>\n</attempt_completion>"
+    # ── No tool tag found → do NOT wrap as attempt_completion ────────────────
+    # Instead: extract inline command if present, else ask to proceed
+    if not any(tag in answer for tag in KNOWN_TOOLS):
+        # Try to detect an inline shell command the model described
+        cmd_match = re.search(
+            r"(?:run|execute|use|try|command)[:\s`]+([^\n`]{5,200})",
+            answer, re.IGNORECASE
+        )
+        if cmd_match:
+            cmd = cmd_match.group(1).strip().strip("`").strip('"').strip("'")
+            answer = (
+                f"<execute_command>\n"
+                f"<command>{cmd}</command>\n"
+                f"<requires_approval>false</requires_approval>\n"
+                f"</execute_command>"
+            )
+        else:
+            # Model gave a pure description — force it to start with list_files
+            # so Cline gets a real first step instead of a premature completion
+            answer = (
+                "<list_files>\n"
+                "<path>.</path>\n"
+                "<recursive>false</recursive>\n"
+                "</list_files>"
+            )
 
     return answer.strip()
 
@@ -575,7 +596,7 @@ async def chat_completions(request: Request):
     if not messages:
         return JSONResponse({"error": "messages field is required"}, status_code=400)
 
-    # ── Resolve mode + wrapper model ─────────────────────────────────────────
+    # ── Resolve mode + wrapper model ──────────────────────────────────────────
     mode          = resolve_mode(model)
     wrapper_model = resolve_wrapper_model(model, mode)
     print(f"[Request] model={model} → mode={mode}, wrapper_model={wrapper_model}")
@@ -585,7 +606,7 @@ async def chat_completions(request: Request):
     if files:
         print(f"[Images] {len(files)} image(s) from latest message → uploading via S3")
 
-    # ── Build text query (all messages for context) ───────────────────────────
+    # ── Build text query ──────────────────────────────────────────────────────
     query = await build_query_async(messages, tools or None)
 
     # ── Call wrapper ──────────────────────────────────────────────────────────
@@ -598,7 +619,7 @@ async def chat_completions(request: Request):
                     query,
                     mode=mode,
                     model=wrapper_model,
-                    files=files,           # ← only current message's images
+                    files=files,
                     stream=False,
                 )
             ),
